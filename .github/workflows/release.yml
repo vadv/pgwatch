@@ -54,9 +54,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ 
-          {file: 'docker/Dockerfile', name: 'cybertecpostgresql/pgwatch'}, 
-          {file: 'docker/demo/Dockerfile', name: 'cybertecpostgresql/pgwatch-demo'}
+        image: [
+          {file: 'docker/Dockerfile', name: 'ghcr.io/${{ github.repository_owner }}/pgwatch'}
         ]
     runs-on: ubuntu-latest
     steps:
@@ -77,9 +76,9 @@ jobs:
       with:
         dockerfile: ${{ matrix.image.file }}
         image-name: ${{ matrix.image.name }}
-        registry: docker.io
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
         platforms: linux/amd64,linux/arm64
         push: ${{ steps.meta.outputs.SHOULD_PUSH }}
         cache-scope: shared-release
