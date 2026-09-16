@@ -13,6 +13,7 @@ import (
 
 	"github.com/cybertec-postgresql/pgwatch/v6/internal/log"
 	"github.com/cybertec-postgresql/pgwatch/v6/internal/metrics"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
@@ -137,8 +138,55 @@ func (promw *PrometheusWriter) Write(msg metrics.MeasurementEnvelope) error {
 	if len(msg.Data) == 0 {
 		return nil
 	}
+	if msg.MetricName == pgbouncerStatsMetric && msg.SourceKind != "prometheus" {
+		data, err := normalizePgBouncerStats(msg.Data)
+		if err != nil {
+			return fmt.Errorf("[%s:%s]: %w", msg.DBName, msg.MetricName, err)
+		}
+		msg.Data = data
+	}
 	promw.AddCacheEntry(msg.DBName, msg.MetricName, msg)
 	return nil
+}
+
+const pgbouncerStatsMetric = "pgbouncer_stats"
+
+// normalizePgBouncerStats returns a copy of PgBouncer SHOW STATS rows in the
+// shape the Prometheus writer expects: the pool name arrives in a plain
+// "database" text column, which becomes the "tag_database" label, and the
+// counters arrive as NUMERIC (PgBouncer 1.12+), which become int64.
+// NULL is preserved; values that do not fit int64 (fractions, overflow, NaN,
+// infinity) are rejected. The input rows are not modified, so other sinks
+// keep the original column name and types.
+func normalizePgBouncerStats(data metrics.Measurements) (metrics.Measurements, error) {
+	normalized := make(metrics.Measurements, len(data))
+	for i, row := range data {
+		copied := maps.Clone(row)
+		if database, ok := copied["database"]; ok {
+			copied[metrics.TagPrefix+"database"] = database
+			delete(copied, "database")
+		}
+		for field, value := range copied {
+			numeric, ok := value.(pgtype.Numeric)
+			if !ok {
+				continue
+			}
+			if !numeric.Valid {
+				copied[field] = nil
+				continue
+			}
+			if numeric.NaN || numeric.InfinityModifier != pgtype.Finite {
+				return nil, fmt.Errorf("column %s: non-finite numeric", field)
+			}
+			n, err := numeric.Int64Value()
+			if err != nil {
+				return nil, fmt.Errorf("column %s: %w", field, err)
+			}
+			copied[field] = n.Int64
+		}
+		normalized[i] = copied
+	}
+	return normalized, nil
 }
 
 // SyncMetric is called by reaper when a metric or monitored source is removed or added,
@@ -155,8 +203,7 @@ func (promw *PrometheusWriter) SyncMetric(sourceName, metricName string, op Sync
 
 var notSupportedMetrics = map[string]struct{}{
 	"change_events":     {}, // fully consist of text columns
-	"pgbouncer_stats":   {}, // this and below metrics column names cannot be renamed with tag_ prefix
-	"pgbouncer_clients": {},
+	"pgbouncer_clients": {}, // this and below metrics column names cannot be renamed with tag_ prefix
 	"pgpool_processes":  {},
 	"pgpool_stats":      {},
 }

@@ -1142,6 +1142,18 @@ metrics:
             This metric helps administrators monitor PgBouncer performance and connection pooling efficiency.
         sqls:
             0: show stats
+        gauges:
+            - avg_server_assignment_count
+            - avg_xact_count
+            - avg_query_count
+            - avg_recv
+            - avg_sent
+            - avg_xact_time
+            - avg_query_time
+            - avg_wait_time
+            - avg_client_parse_count
+            - avg_server_parse_count
+            - avg_bind_count
     pgbouncer_clients:
         description: >
             Retrieves client connection statistics from the PgBouncer connection pooler, providing insights into the current state of client connections.

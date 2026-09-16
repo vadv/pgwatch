@@ -1,6 +1,7 @@
 package sinks
 
 import (
+	"math/big"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/cybertec-postgresql/pgwatch/v6/internal/log"
 	"github.com/cybertec-postgresql/pgwatch/v6/internal/metrics"
 	"github.com/cybertec-postgresql/pgwatch/v6/internal/testutil"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -438,6 +440,100 @@ func TestPrometheusWriter_NonPromSourced_NamespacePrefix(t *testing.T) {
 
 	descStr := dataMetrics[0].Desc().String()
 	assert.Contains(t, descStr, `fqName: "`+namespace+`_pg_stat_activity_numbackends"`)
+}
+
+// TestPrometheusWriter_PgBouncerStats verifies that PgBouncer SHOW STATS rows
+// are exported: the "database" text column becomes the "database" label, the
+// NUMERIC counters become numbers, avg_* columns are gauges and total_* columns
+// are counters. The rows handed to Write must stay untouched for other sinks.
+func TestPrometheusWriter_PgBouncerStats(t *testing.T) {
+	promw := newTestPrometheusWriter("pgwatch")
+	require.NoError(t, promw.DefineMetrics(metrics.GetDefaultMetrics()))
+
+	numeric := func(v int64) pgtype.Numeric { return pgtype.Numeric{Int: big.NewInt(v), Valid: true} }
+	epoch := time.Now().UnixNano()
+	env := metrics.MeasurementEnvelope{
+		DBName:     "pgb",
+		MetricName: "pgbouncer_stats",
+		SourceKind: "pgbouncer",
+		Data: metrics.Measurements{
+			{metrics.EpochColumnName: epoch, "database": "app_a", "total_query_count": numeric(102), "avg_query_count": numeric(3), "total_wait_time": pgtype.Numeric{}},
+			{metrics.EpochColumnName: epoch, "database": "app_b", "total_query_count": numeric(9007199254740993), "avg_query_count": numeric(0), "total_wait_time": pgtype.Numeric{}},
+		},
+	}
+	require.NoError(t, promw.Write(env))
+
+	// original rows are untouched
+	for _, row := range env.Data {
+		assert.IsType(t, pgtype.Numeric{}, row["total_query_count"])
+		assert.Contains(t, row, "database")
+		assert.NotContains(t, row, "tag_database")
+	}
+
+	cached := promw.Cache["pgb"]["pgbouncer_stats"]
+	require.Len(t, cached.Data, 2)
+	assert.Equal(t, int64(102), cached.Data[0]["total_query_count"])
+	assert.Nil(t, cached.Data[0]["total_wait_time"], "NULL is preserved")
+	assert.Equal(t, "app_a", cached.Data[0]["tag_database"])
+
+	ch := make(chan prometheus.Metric, 100)
+	written, errCount := promw.WritePromMetrics(cached, ch)
+	close(ch)
+	assert.Zero(t, errCount, "no duplicate series")
+	assert.Equal(t, 4, written)
+
+	got := map[string]float64{} // "<fqName>{database}" → value
+	for _, m := range collectDataMetrics(t, ch, "pgbouncer_stats") {
+		var d dto.Metric
+		require.NoError(t, m.Write(&d))
+		labels := map[string]string{}
+		for _, l := range d.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		assert.Equal(t, "pgb", labels["dbname"])
+		desc := m.Desc().String()
+		switch {
+		case strings.Contains(desc, `fqName: "pgwatch_pgbouncer_stats_total_query_count"`):
+			require.NotNil(t, d.Counter, "total_* must be a counter")
+			got["total_query_count{"+labels["database"]+"}"] = d.Counter.GetValue()
+		case strings.Contains(desc, `fqName: "pgwatch_pgbouncer_stats_avg_query_count"`):
+			require.NotNil(t, d.Gauge, "avg_* must be a gauge")
+			got["avg_query_count{"+labels["database"]+"}"] = d.Gauge.GetValue()
+		default:
+			t.Errorf("unexpected metric %s", desc)
+		}
+	}
+	assert.Equal(t, map[string]float64{
+		"total_query_count{app_a}": 102,
+		"total_query_count{app_b}": 9007199254740992, // float64 rounding on export, int64 kept in cache
+		"avg_query_count{app_a}":   3,
+		"avg_query_count{app_b}":   0,
+	}, got)
+	assert.Equal(t, int64(9007199254740993), cached.Data[1]["total_query_count"])
+}
+
+// TestPrometheusWriter_PgBouncerStatsRejectsNonInteger verifies that SHOW STATS
+// values that do not fit int64 are rejected instead of being silently exported.
+func TestPrometheusWriter_PgBouncerStatsRejectsNonInteger(t *testing.T) {
+	for name, value := range map[string]pgtype.Numeric{
+		"overflow": {Int: new(big.Int).Lsh(big.NewInt(1), 63), Valid: true},
+		"fraction": {Int: big.NewInt(15), Exp: -1, Valid: true},
+		"NaN":      {NaN: true, Valid: true},
+		"infinity": {InfinityModifier: pgtype.Infinity, Valid: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			promw := newTestPrometheusWriter("pgwatch")
+			err := promw.Write(metrics.MeasurementEnvelope{
+				DBName:     "pgb",
+				MetricName: "pgbouncer_stats",
+				Data: metrics.Measurements{
+					{metrics.EpochColumnName: time.Now().UnixNano(), "database": "app_a", "total_query_count": value},
+				},
+			})
+			require.ErrorContains(t, err, "total_query_count")
+			assert.NotContains(t, promw.Cache, "pgb")
+		})
+	}
 }
 
 // BenchmarkWritePromMetrics measures the per-scrape conversion cost of one
