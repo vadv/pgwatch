@@ -27,6 +27,8 @@ import (
 )
 
 func TestSourceConn_Connect(t *testing.T) {
+	original := sources.NewConnWithConfig
+	t.Cleanup(func() { sources.NewConnWithConfig = original })
 
 	t.Run("failed config parsing", func(t *testing.T) {
 		md := &sources.DbConn{}
@@ -47,7 +49,9 @@ func TestSourceConn_Connect(t *testing.T) {
 	t.Run("successful connection to pgbouncer", func(t *testing.T) {
 		mock, err := pgxmock.NewPool()
 		require.NoError(t, err)
-		sources.NewConnWithConfig = func(_ context.Context, _ *pgxpool.Config, _ ...db.ConnConfigCallback) (db.PgxPoolIface, error) {
+		sources.NewConnWithConfig = func(_ context.Context, config *pgxpool.Config, _ ...db.ConnConfigCallback) (db.PgxPoolIface, error) {
+			require.NotNil(t, config.ShouldPing, "pgxpool must not send \"-- ping\" to PgBouncer")
+			assert.False(t, config.ShouldPing(ctx, pgxpool.ShouldPingParams{IdleDuration: 5 * time.Second}))
 			return mock, nil
 		}
 
@@ -62,6 +66,19 @@ func TestSourceConn_Connect(t *testing.T) {
 		err = md.Connect(ctx, opts)
 		assert.NoError(t, err)
 
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("postgres keeps pool ping", func(t *testing.T) {
+		mock, err := pgxmock.NewPool()
+		require.NoError(t, err)
+		sources.NewConnWithConfig = func(_ context.Context, config *pgxpool.Config, _ ...db.ConnConfigCallback) (db.PgxPoolIface, error) {
+			assert.Nil(t, config.ShouldPing, "pgxpool's default liveness check must stay enabled for PostgreSQL")
+			return mock, nil
+		}
+		md := &sources.DbConn{Source: sources.Source{Kind: sources.SourcePostgres}}
+		mock.ExpectPing()
+		assert.NoError(t, md.Connect(ctx, sources.CmdOpts{}))
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 }

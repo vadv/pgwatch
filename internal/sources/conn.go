@@ -177,6 +177,10 @@ func (md *DbConn) Connect(ctx context.Context, opts CmdOpts) (err error) {
 		}
 		if md.Kind == SourcePgBouncer {
 			md.ConnConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+			// pgxpool pings idle connections with "-- ping" before reuse, which the
+			// PgBouncer admin console rejects; the pool then discards the connection
+			// and opens a new one. Liveness is checked by Ping() with SHOW VERSION.
+			md.ConnConfig.ShouldPing = func(context.Context, pgxpool.ShouldPingParams) bool { return false }
 		}
 		if opts.MaxParallelConnectionsPerDb > 0 {
 			md.ConnConfig.MaxConns = int32(opts.MaxParallelConnectionsPerDb)
